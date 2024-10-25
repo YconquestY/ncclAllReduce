@@ -9,10 +9,18 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <cstdio>
+#include <random>
+#include <vector>
+#include <thread>
 
-constexpr size_t cnt = 1;
+constexpr size_t cnt = 1024 / sizeof(half);
+constexpr int    dSize = 8;
+constexpr float  low = 0.f,
+                 high = 1.f;
+constexpr int    seed = 595;
 
 #define MPICHECK(cmd) do {  \
   int e = cmd;              \
@@ -39,6 +47,54 @@ constexpr size_t cnt = 1;
   }                         \
 } while(0)
 
+template<typename S, typename T>
+void random_fill(S* v, T low, T high)
+{
+    std::mt19937 gen(seed);
+    std::uniform_real_distribution<float> dis(static_cast<float>(low),
+                                              static_cast<float>(high));
+    for (size_t i = 0; i < cnt; ++i) {
+        v[i] = static_cast<S>(dis(gen));
+    }
+}
+
+void threadFn(int hSize, int hRank, int dRank, ncclUniqueId* id)
+{
+    CUDACHECK(cudaSetDevice(dRank));
+
+    cudaStream_t stream;
+    CUDACHECK(cudaStreamCreate(&stream));
+
+    ncclComm_t comm;
+    NCCLCHECK(ncclCommInitRank(&comm, hSize * dSize, *id, hRank * dSize + dRank));
+
+    half* hIn  = new half[cnt]; random_fill(hIn, low, high);
+    half* hOut = new half[cnt];
+
+    half* dIn;
+    half* dOut;
+    CUDACHECK(cudaMalloc(&dIn , cnt * sizeof(half)));
+    CUDACHECK(cudaMalloc(&dOut, cnt * sizeof(half)));
+
+    CUDACHECK(cudaMemcpyAsync(dIn, hIn, cnt * sizeof(half), cudaMemcpyHostToDevice, stream));
+    NCCLCHECK(ncclAllReduce(
+        reinterpret_cast<const void*>(dIn),
+        reinterpret_cast<void*>(dOut),
+        cnt,
+        ncclHalf,
+        ncclSum,
+        comm,
+        stream
+    ));
+    CUDACHECK(cudaMemcpyAsync(hOut, dOut, cnt * sizeof(half), cudaMemcpyDeviceToHost, stream));
+
+    NCCLCHECK(ncclCommDestroy(comm));
+    delete[] hIn;
+    delete[] hOut;
+    CUDACHECK(cudaFree(dIn));
+    CUDACHECK(cudaFree(dOut));
+}
+
 int main(int argc, char* argv[])
 {
     int hRank,
@@ -54,48 +110,20 @@ int main(int argc, char* argv[])
     }
     MPI_Bcast((void*) &id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
 
-    ncclComm_t comm;
-    NCCLCHECK(ncclCommInitRank(&comm, hSize, id, hRank)); // Each node provides 1 device.
-    CUDACHECK(cudaSetDevice(0));
-
-    float* dIn;
-    float* dOut;
-    CUDACHECK(cudaMalloc(&dIn , cnt * sizeof(float)));
-    CUDACHECK(cudaMalloc(&dOut, cnt * sizeof(float)));
-
-    float* hIn  = new float[cnt];
-    for (int i = 0; i < cnt; ++i) {
-        hIn[i] = static_cast<float>(i + 1);
+    std::vector<std::thread> workers; workers.reserve(dSize);
+    for (int i = 0; i < dSize; ++i) {
+        workers.emplace_back(
+            threadFn,
+            hSize,
+            hRank,
+            i,
+            &id
+        );
     }
-    float* hOut = new float[cnt];
 
-    cudaStream_t stream;
-    CUDACHECK(cudaStreamCreate(&stream));
-
-    CUDACHECK(cudaMemcpyAsync(dIn, hIn, cnt * sizeof(float), cudaMemcpyHostToDevice, stream));
-    NCCLCHECK(ncclAllReduce(
-        reinterpret_cast<const void*>(dIn),
-        reinterpret_cast<void*>(dOut),
-        cnt,
-        ncclFloat,
-        ncclSum,
-        comm,
-        stream
-    ));
-
-    CUDACHECK(cudaMemcpyAsync(hOut, dOut, cnt * sizeof(float), cudaMemcpyDeviceToHost, stream));
-
-    std::printf("rank %d: ", hRank);
-    for (int i = 0; i < cnt; ++i) {
-        std::printf("%f ", hOut[i]);
+    for (auto&& t : workers) {
+        t.join();
     }
-    std::printf("\n");
-    
-    MPICHECK(MPI_Finalize());
-    delete[] hIn;
-    delete[] hOut;
-    CUDACHECK(cudaFree(dIn));
-    CUDACHECK(cudaFree(dOut));
-    NCCLCHECK(ncclCommDestroy(comm));
-    CUDACHECK(cudaStreamDestroy(stream));
+
+    MPI_Finalize();
 }

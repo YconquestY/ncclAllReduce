@@ -14,7 +14,7 @@ NCCL89INCDIR = /mnt/llm/workspace/yuyue2/.local/nccl_89/include/
 NCCL89LNKDIR = /mnt/llm/workspace/yuyue2/.local/nccl_89/lib/
 
 FLAGS   = -std=c++17 -O3 --generate-line-info
-LDFLAGS = -lmpi -lnccl
+LDFLAGS = -lnccl -lmpi -lpthread
 
 all: a100 4090
 
